@@ -54,7 +54,7 @@ class LLMEditor:
                 "3. Place text boxes at positions matching the schema.\n"
                 f"4. use these font properties: font_name=\"{main_font}\", color=\"{main_color}\" (6-digit hex, no #), "
                 f"title_size={title_size}pt bold, body_size={fonts.get('body_size', 16)}pt.\n"
-                f"5. Title/heading text (>{title_size}pt or bold): ≤20 Chinese chars or ≤10 English words. "
+                f"5. Title/heading text (>{title_size}pt or bold): ≤15 Chinese chars or ≤10 English words. "
                 f"Body text: keep concise, use bullet points (•).\n"
             )
             op_example = (
@@ -75,7 +75,7 @@ class LLMEditor:
                 "   - Small text at the bottom → footer / page number (leave empty)\n"
                 "4. Do NOT set font properties in modify_text. The template's own "
                 "font size, bold, and color are already correct.\n"
-                "5. Title/heading: ≤20 Chinese chars or ≤10 English words. "
+                "5. Title/heading: ≤15 Chinese chars or ≤10 English words. "
                 "Body text: keep concise, use bullet points (•).\n"
             )
             op_example = (
@@ -102,9 +102,31 @@ class LLMEditor:
 
         # ── Assemble prompt ─────────────────────────────────────────────
         schema_json = json.dumps(schema, indent=2, ensure_ascii=False) if schema else "{}"
+        # ── Revision feedback ──────────────────────────────────────────
+        feedback = content.pop("_revision_feedback", "")
+        feedback_block = ""
+        if feedback:
+            feedback_block = (
+                f"## Revision Feedback (IMPROVE based on this)\n"
+                f"{feedback}\n\n"
+            )
+
+        # ── Shape size info ──────────────────────────────────────────
+        shape_sizes = content.pop("_shape_sizes", {})
+        shapes_info = ""
+        if shape_sizes:
+            lines = ["## Shape sizes (text must fit at this font size)"]
+            for sid, info in shape_sizes.items():
+                sz = info.get("font_size", "?")
+                b = "bold" if info.get("bold") else "normal"
+                lines.append(f"  shape_id={sid}: {sz}pt {b}")
+            shapes_info = "\n".join(lines) + "\n\n"
+
         content_json = json.dumps(content, indent=2, ensure_ascii=False)
 
         prompt = (
+            f"{feedback_block}"
+            f"{shapes_info}"
             f"Edit this slide with the given content.\n\n"
             f"## Constraints\n{constraints}\n"
             f"{rewriting}\n"

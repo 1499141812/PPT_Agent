@@ -102,13 +102,9 @@ def parse_docx(path: Path) -> SourceDocument:
                 sec["paragraphs"].append(text)
                 full_text_parts.append(text)
 
-            # Extract inline images from this paragraph
+            # Extract images (nested inside drawings — inline or anchored)
             for run in para.runs:
-                for blip in run._element.findall(
-                    qn("a:drawing") + "/" + qn("wp:inline") + "/" + qn("a:graphic")
-                    + "/" + qn("a:graphicData") + "/" + qn("pic:pic") + "/" + qn("pic:blipFill")
-                    + "/" + qn("a:blip")
-                ):
+                for blip in run._element.iter(qn("a:blip")):
                     embed = blip.get(qn("r:embed"))
                     if embed:
                         img_part = doc.part.related_parts.get(embed)
@@ -156,6 +152,23 @@ def parse_docx(path: Path) -> SourceDocument:
             full_text_parts.append(_table_to_text(headers, rows))
 
     _flush_section()
+
+    # Fallback: scan all document rels for images not caught via blip iteration
+    if image_counter == 0:
+        for rel in doc.part.rels.values():
+            if "image" in str(rel.reltype).lower():
+                try:
+                    image_counter += 1
+                    saved_path = _save_extracted_image(
+                        rel.target_part.blob, path.stem, image_counter
+                    )
+                    images.append({
+                        "caption": f"Image {image_counter}",
+                        "path_to_saved_image": saved_path,
+                        "page": None,
+                    })
+                except Exception:
+                    pass
 
     # If no sections detected, create one with all text
     if not sections:
@@ -290,13 +303,9 @@ def parse_docx(path: Path) -> SourceDocument:
                 sec["paragraphs"].append(text)
                 full_text_parts.append(text)
 
-            # Extract inline images from this paragraph
+            # Extract images (nested inside drawings — inline or anchored)
             for run in para.runs:
-                for blip in run._element.findall(
-                    qn("a:drawing") + "/" + qn("wp:inline") + "/" + qn("a:graphic")
-                    + "/" + qn("a:graphicData") + "/" + qn("pic:pic") + "/" + qn("pic:blipFill")
-                    + "/" + qn("a:blip")
-                ):
+                for blip in run._element.iter(qn("a:blip")):
                     embed = blip.get(qn("r:embed"))
                     if embed:
                         img_part = doc.part.related_parts.get(embed)
@@ -344,6 +353,23 @@ def parse_docx(path: Path) -> SourceDocument:
             full_text_parts.append(_table_to_text(headers, rows))
 
     _flush_section()
+
+    # Fallback: scan all document rels for images not caught via blip iteration
+    if image_counter == 0:
+        for rel in doc.part.rels.values():
+            if "image" in str(rel.reltype).lower():
+                try:
+                    image_counter += 1
+                    saved_path = _save_extracted_image(
+                        rel.target_part.blob, path.stem, image_counter
+                    )
+                    images.append({
+                        "caption": f"Image {image_counter}",
+                        "path_to_saved_image": saved_path,
+                        "page": None,
+                    })
+                except Exception:
+                    pass
 
     # If no sections detected, create one with all text
     if not sections:

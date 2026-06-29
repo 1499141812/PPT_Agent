@@ -68,17 +68,15 @@ def build_workflow() -> StateGraph:
     # After edit → evaluate
     workflow.add_edge("edit_slide", "evaluate_slide")
 
-    # After evaluation: next slide or finish
+    # After evaluation: revise, next, or finish
     workflow.add_conditional_edges(
         "evaluate_slide",
-        _decide_after_evaluation,
-        {
-            "revise": "edit_slide",    # re-edit same slide
-            "next": "edit_slide",      # edit the next slide
-            "finish": "finalize",      # all slides done
-        },
+        lambda s: (
+            "finish" if s["current_slide_idx"] >= len(s["slide_states"])
+            else s.get("_route", "next")
+        ),
+        {"revise": "edit_slide", "next": "edit_slide", "finish": "finalize"},
     )
-
     workflow.add_edge("finalize", END)
 
     return workflow.compile()
@@ -103,6 +101,12 @@ def parse_documents_node(state: AgentState) -> AgentState:
                 len(source_doc["sections"]),
                 len(source_doc["tables"]),
                 len(source_doc["images"]))
+    print(f"  [Step 1/6] 源文档: {len(source_doc['sections'])}章节, "
+          f"{len(source_doc['tables'])}表格, {len(source_doc['images'])}图片")
+    for img in source_doc.get("images", [])[:5]:
+        p = img.get("path_to_saved_image", "?")
+        print(f"    图片: {img.get('caption', '?')} → {p} "
+              f"({'存在' if Path(p).exists() else '缺失'})")
 
     # Parse reference PPT
     ref_path = state["reference_pptx_path"]
@@ -766,10 +770,7 @@ def plan_outline_node(state: AgentState) -> AgentState:
     n_sections = len(source_doc.get("sections", []))
     min_slides = max(n_sections, 3)  # at least title + content + ending
 
-    if schemas:
-        outline = planner.plan(source_doc, schemas)
-    else:
-        outline = planner.plan_from_text(source_doc["full_text"], [])
+    outline = planner.plan(source_doc, schemas or [])
 
     # Ensure minimum slide count
     if len(outline) < min_slides:
@@ -833,15 +834,15 @@ def edit_slide_node(state: AgentState) -> AgentState:
     Every slide starts blank — always ADD-only, no modify/delete needed.
     """
     current_idx = state["current_slide_idx"]
+    # Guard: stop if past last slide (evaluate advances past end)
+    if current_idx >= len(state["slide_states"]):
+        return state
+
     outline = state["outline"]
     slide_state = state["slide_states"][current_idx]
 
     print(f"\n  [Slide {current_idx + 1}/{len(outline)}] "
           f"生成: {outline[current_idx].get('title', 'Untitled')}")
-
-    # Safety check
-    if current_idx >= len(state["slide_states"]):
-        return state
 
     schemas = state["layout_schemas"]
     source_doc = state["source_doc"]
@@ -900,6 +901,11 @@ def edit_slide_node(state: AgentState) -> AgentState:
     content: dict[str, Any] = {}
     if current_idx < len(outline):
         content = outline[current_idx].get("content", {})
+    # On revision, inject previous feedback
+    if slide_state["revision_round"] > 0:
+        fb = slide_state.get("evaluation_feedback", "")
+        if fb:
+            content["_revision_feedback"] = fb
 
     # Images: only real existing files
     raw_images = source_doc.get("images", []) if source_doc else []
@@ -919,10 +925,12 @@ def edit_slide_node(state: AgentState) -> AgentState:
     from src.editing.llm_editor import LLMEditor
     llm_editor = LLMEditor()
 
-    # Inject font info from reference PPT into the content
+    # Inject font info + shape sizes into content for LLM
     fonts = enrichment.get("extracted_fonts", {})
     if fonts:
         content["_fonts"] = fonts
+    if enrichment.get("_saved_fonts"):
+        content["_shape_sizes"] = enrichment["_saved_fonts"]
 
     # Determine if slide has existing shapes (cloned from template)
     # vs. being truly blank (added as new). Cloned slides have shapes
@@ -999,41 +1007,47 @@ def edit_slide_node(state: AgentState) -> AgentState:
 
 
 def evaluate_slide_node(state: AgentState) -> AgentState:
-    """Node 5: Evaluate, then decide whether to advance or stay for revision."""
+    """Node 5: LLM evaluate + trigger revision if score < threshold."""
     current_idx = state["current_slide_idx"]
     if current_idx >= len(state["slide_states"]):
         return state
 
     slide_state = state["slide_states"][current_idx]
     output_pptx = state["output_pptx"]
-    cfg = get_config()
+    MAX_REVISIONS = 2
 
     if current_idx < len(output_pptx.slides):
-        from src.evaluation.evaluator import RuleBasedEvaluator
-        result = RuleBasedEvaluator().evaluate(output_pptx.slides[current_idx], current_idx)
-        slide_state["evaluation_scores"] = {
-            "content_richness": result.content_richness,
-            "design_aesthetics": result.design_aesthetics,
-            "structural_coherence": result.structural_coherence,
-        }
-        slide_state["overall_score"] = result.overall_score
-        slide_state["is_acceptable"] = result.is_acceptable
-        slide_state["evaluation_feedback"] = result.feedback
-        print(f"     评分: {result.overall_score:.1f}/10 "
-              f"(内容{result.content_richness:.0f} 设计{result.design_aesthetics:.0f} 结构{result.structural_coherence:.0f})")
+        html = slide_to_html(output_pptx.slides[current_idx], current_idx)
+        outline = state.get("outline", [])
+        summary = outline[current_idx].get("content_summary", "") if current_idx < len(outline) else ""
 
-        threshold = cfg.editing.evaluation_threshold
-        max_rev = cfg.editing.max_revision_rounds
-        if result.overall_score < threshold and slide_state["revision_round"] < max_rev:
-            slide_state["revision_round"] += 1
-            slide_state["_needs_revision"] = True  # ponytail: flag for routing
-            print(f"     🔄 评分{result.overall_score:.1f}<{threshold}，"
-                  f"第{slide_state['revision_round']}/{max_rev}次修正")
+        # LLM evaluation
+        from src.evaluation.evaluator import llm_evaluate
+        score, suggestions = llm_evaluate(html, summary)
+        slide_state["overall_score"] = score
+        slide_state["is_acceptable"] = score >= 6.0
+
+        if suggestions:
+            slide_state["evaluation_feedback"] = suggestions
+            slide_state["evaluation_suggestions"] = suggestions.split("\n") if suggestions else []
+
+        print(f"     评分: {score:.1f}/10", end="")
+        if suggestions:
+            print(f" — {suggestions[:80]}...")
         else:
-            slide_state["_needs_revision"] = False
+            print()
+
+        # Revision logic
+        if score < 6.0 and slide_state["revision_round"] < MAX_REVISIONS:
+            slide_state["revision_round"] += 1
+            state["_route"] = "revise"
+            print(f"     🔄 第{slide_state['revision_round']}/{MAX_REVISIONS}次修正")
+        else:
             state["current_slide_idx"] = current_idx + 1
+            state["_route"] = "next"
     else:
         state["current_slide_idx"] = current_idx + 1
+        state["_route"] = "next"
 
     return state
 
@@ -1137,16 +1151,6 @@ def finalize_node(state: AgentState) -> AgentState:
 
 
 # ── Conditional routing ─────────────────────────────────────────────────────
-
-def _decide_after_evaluation(state: AgentState) -> Literal["revise", "next", "finish"]:
-    """Read-only routing. evaluate_slide_node sets _needs_revision flag."""
-    idx = state["current_slide_idx"]
-    if idx >= len(state["slide_states"]):
-        return "finish"
-    if state["slide_states"][idx].get("_needs_revision"):
-        return "revise"
-    return "next"
-
 
 # ── Convenience runner ──────────────────────────────────────────────────────
 

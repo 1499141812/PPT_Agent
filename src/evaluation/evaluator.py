@@ -22,6 +22,33 @@ from src.pptx_io.html_converter import slide_to_html
 logger = logging.getLogger(__name__)
 
 
+def llm_evaluate(
+    slide_html: str,
+    content_summary: str,
+    client: Optional[LLMClient] = None,
+) -> tuple[float, str]:
+    """LLM-based slide evaluation with actionable feedback.
+
+    Returns (score, suggestions) where suggestions is text the editor
+    can use to improve the slide on the next revision pass.
+    """
+    client = client or get_llm_client()
+    prompt = (
+        f"Score this slide 1-10 on content quality and conciseness.\n\n"
+        f"Intended content: {content_summary}\n\n"
+        f"Slide HTML:\n```html\n{slide_html[:3000]}\n```\n\n"
+        f"Return JSON: {{\"score\": 7.5, \"suggestions\": \"具体的改进建议\"}}\n"
+        f"Be critical. Suggest specific improvements: shorter title, better bullets, etc."
+    )
+    try:
+        result = client.json_chat(prompt)
+        score = float(result.get("score", 7.0))
+        suggestions = str(result.get("suggestions", ""))
+        return min(10, max(1, score)), suggestions
+    except Exception:
+        return 7.0, ""
+
+
 @dataclass
 class EvaluationResult:
     """Structured evaluation result for a single slide."""

@@ -82,21 +82,6 @@ class StyleConfig:
 
 
 @dataclass
-class EditingConfig:
-    """Parameters for the edit-based generation loop."""
-
-    max_revision_rounds: int = 3
-    evaluation_threshold: float = 7.0  # 0-10 scale, re-edit if below
-    evaluation_dimensions: list = field(
-        default_factory=lambda: [
-            "content_richness",
-            "design_aesthetics",
-            "structural_coherence",
-        ]
-    )
-
-
-@dataclass
 class GenerationConfig:
     """Parameters for chart / image generation."""
 
@@ -112,7 +97,6 @@ class AppConfig:
 
     llm: LLMConfig = field(default_factory=LLMConfig)
     style: StyleConfig = field(default_factory=StyleConfig)
-    editing: EditingConfig = field(default_factory=EditingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     project_root: Path = _PROJECT_ROOT
     output_dir: Path = field(default_factory=lambda: _PROJECT_ROOT / "output")
