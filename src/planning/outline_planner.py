@@ -90,19 +90,15 @@ Output a JSON array where each element is:
         schemas: list[LayoutSchema],
         *,
         max_slides: int = 30,
-        language: str = "zh",
+        language: str = "",
     ) -> list[dict[str, Any]]:
-        """Generate a slide outline.
-
-        Args:
-            source_doc: Parsed source document.
-            schemas: Available layout schemas from style analysis.
-            max_slides: Upper bound on slide count.
-            language: Output language hint ("zh" or "en").
-
-        Returns:
-            List of outline items, one per planned slide.
         """
+        Generate a slide outline.
+
+        language: Output language. Defaults to PPT_LANGUAGE env var, then "zh".
+        """
+        import os
+        language = language or os.getenv("PPT_LANGUAGE", "zh")
         # Prepare source document summary
         sections_text = _format_sections(source_doc["sections"])
         tables_text = _format_tables(source_doc["tables"])

@@ -66,17 +66,14 @@ class LLMEditor:
             )
         else:
             constraints = (
-                "1. The slide ALREADY has empty text boxes, each with a data-shape-id attribute.\n"
-                "2. You MUST ONLY use modify_text. Do NOT use add_text, add_image, "
-                "add_table, or delete_shape — the boxes are already there, just fill them.\n"
-                "3. How to identify each box's role from the HTML:\n"
-                "   - The box at the TOP with the LARGEST font-size → title\n"
-                "   - A larger box below, usually with smaller font → body\n"
-                "   - Small text at the bottom → footer / page number (leave empty)\n"
-                "4. Do NOT set font properties in modify_text. The template's own "
-                "font size, bold, and color are already correct.\n"
-                "5. Title/heading: ≤15 Chinese chars or ≤10 English words. "
-                "Body text: keep concise, use bullet points (•).\n"
+                "1. Slide has empty text boxes (data-shape-id in HTML). "
+                "Use modify_text to fill them.\n"
+                "2. If images are available AND content has an image_hint, "
+                "use add_image to insert the matching image.\n"
+                "3. Do NOT use add_text — text boxes already exist.\n"
+                "4. Identify box roles from HTML (top+largest font=title, lower=body).\n"
+                "5. Title: ≤15 Chinese chars or ≤10 English words. "
+                "Body: bullet points (•).\n"
             )
             op_example = (
                 f'{{"op_type": "modify_text", "slide_idx": 0, '
@@ -87,17 +84,18 @@ class LLMEditor:
 
         # ── Content rewriting rules ─────────────────────────────────────
         rewriting = (
-            "6. Content rewriting: preserve all numbers, facts, and proper names. "
-            "Condense by removing filler words, not key points. "
-            "Do not invent claims not present in the source content.\n"
-            "7. Never invent image paths or table data. Only use items listed below.\n"
+            "7. Preserve all numbers, facts, proper names. Condense, don't fabricate.\n"
         )
 
         # ── Output format ───────────────────────────────────────────────
+        img_example = (
+            f'{{"op_type": "add_image", "slide_idx": 0, '
+            f'"payload": {{"image_path": "/path/to/image.png", '
+            f'"position": {{"left": 5.0, "top": 2.0, "width": 4.0, "height": 3.0}}}}}}'
+        )
         output_fmt = (
-            "8. Output a single JSON array. Do NOT wrap in triple backticks. "
-            "Do NOT add any explanation before or after.\n"
-            f"Example: [{op_example}]\n"
+            "6. Output a single JSON array. Do NOT wrap in triple backticks.\n"
+            f"Example (with optional image): [{op_example}, {img_example}]\n"
         )
 
         # ── Assemble prompt ─────────────────────────────────────────────

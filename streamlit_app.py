@@ -77,25 +77,8 @@ def render_sidebar() -> dict[str, Any]:
             help="越高越有创意，越低越保守",
         )
 
-        eval_threshold = st.slider(
-            "评价阈值",
-            min_value=5.0,
-            max_value=9.5,
-            value=7.0,
-            step=0.5,
-            help="低于此分数的幻灯片将被自动修正",
-        )
-
-        max_revisions = st.slider(
-            "最大修正轮数",
-            min_value=0,
-            max_value=5,
-            value=3,
-            step=1,
-        )
-
+        language = st.selectbox("输出语言", ["中文", "English"], index=0)
         use_style = st.checkbox("启用风格分析", value=True)
-        use_evaluation = st.checkbox("启用自动评价与修正", value=True)
 
         st.markdown("---")
         st.caption(f"模型: {get_config().llm.model}")
@@ -106,10 +89,8 @@ def render_sidebar() -> dict[str, Any]:
             "reference_file": reference_file,
             "max_slides": max_slides,
             "temperature": temperature,
-            "eval_threshold": eval_threshold,
-            "max_revisions": max_revisions,
             "use_style": use_style,
-            "use_evaluation": use_evaluation,
+            "language": language,
         }
 
 
@@ -232,6 +213,9 @@ def run_generation(settings: dict[str, Any]) -> None:
             reset_config()
 
         progress_bar.progress(30, "正在分析参考PPT风格...")
+
+        # Set language for planner
+        os.environ["PPT_LANGUAGE"] = "en" if settings["language"].startswith("E") else "zh"
 
         # Run the workflow with progress updates
         final_state = app.invoke(initial_state)

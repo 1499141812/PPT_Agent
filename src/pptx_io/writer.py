@@ -35,6 +35,52 @@ def write_pptx(presentation: Presentation, output_path: str | Path) -> None:
     presentation.save(str(path))
 
 
+def duplicate_slide(prs: Presentation, source_slide: Any) -> Any:
+    """Clone an entire slide like PowerPoint's 'Duplicate Slide'.
+
+    Copies the slide's spTree (shapes), background, and all image/media
+    relationships so pictures render correctly on the new slide.
+    """
+    import copy
+    from lxml import etree
+    from pptx.oxml.ns import qn
+
+    # 1. Create new slide with same layout
+    new_slide = prs.slides.add_slide(source_slide.slide_layout)
+
+    # 2. Copy all image/media relationships from source to new slide
+    for rel in source_slide.part.rels.values():
+        try:
+            new_slide.part.relate_to(rel.target_part, rel.reltype)
+        except Exception:
+            pass
+
+    # 3. Remove default shapes from new slide, copy source shapes
+    spTree = new_slide.shapes._spTree
+    for child in list(spTree):
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag in ('sp', 'pic', 'graphicFrame', 'grpSp', 'cxnSp'):
+            spTree.remove(child)
+
+    for child in source_slide.shapes._spTree:
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag in ('sp', 'pic', 'graphicFrame', 'grpSp', 'cxnSp'):
+            spTree.append(copy.deepcopy(child))
+
+    # 4. Copy per-slide background
+    cSld_src = source_slide._element.find(qn('p:cSld'))
+    cSld_dst = new_slide._element.find(qn('p:cSld'))
+    if cSld_src is not None and cSld_dst is not None:
+        bg = cSld_src.find(qn('p:bg'))
+        if bg is not None:
+            existing = cSld_dst.find(qn('p:bg'))
+            if existing is not None:
+                cSld_dst.remove(existing)
+            cSld_dst.insert(0, copy.deepcopy(bg))
+
+    return new_slide
+
+
 def add_slide(
     presentation: Presentation,
     layout_index: int = 0,

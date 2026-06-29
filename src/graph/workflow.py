@@ -869,10 +869,18 @@ def edit_slide_node(state: AgentState) -> AgentState:
               f"color=#{fonts.get('main_color', '?')}")
 
     # Ensure the slide exists and is ready for editing
+    # For extra slides beyond template count, duplicate a random template
+    import random
     is_new_slide = current_idx >= len(output_pptx.slides)
     while current_idx >= len(output_pptx.slides):
-        from src.pptx_io.writer import add_slide
-        add_slide(output_pptx, layout_index=0)
+        from src.pptx_io.writer import duplicate_slide, clear_slide_text
+        if len(output_pptx.slides) > 0:
+            src = random.choice(list(output_pptx.slides))
+            new_s = duplicate_slide(output_pptx, src)
+            clear_slide_text(new_s)  # Clear old text, keep decorations + images
+        else:
+            from src.pptx_io.writer import add_slide
+            add_slide(output_pptx, layout_index=0)
 
     actual_slide = output_pptx.slides[current_idx]
 
@@ -915,6 +923,9 @@ def edit_slide_node(state: AgentState) -> AgentState:
         and Path(img["path_to_saved_image"]).exists()
     ]
     available_tables = source_doc.get("tables", []) if source_doc else []
+    if current_idx == 0 and available_images:
+        print(f"    源文档图片: {len(available_images)}张可用 "
+              f"({len(raw_images)}张提取, {len(raw_images) - len(available_images)}张缺失)")
 
     # Get HTML view of actual slide
     actual_slide = output_pptx.slides[current_idx]
