@@ -2,6 +2,20 @@
 
 基于 **编辑式生成** 范式的智能PPT生成Agent，能够分析参考PPT风格、解析源文档内容，并通过LLM驱动的增量编辑操作生成风格一致的新PPT，具备自动评价和自我修正能力。
 
+## 📸 项目截图
+
+**Streamlit 界面**
+
+![Streamlit 界面](assets/streamlit-ui.png)
+
+**运行结果**
+
+![运行结果](assets/run-result.png)
+
+**生成的 PPT**
+
+![生成的 PPT](assets/generated-ppt.png)
+
 ## 🧠 核心概念
 
 ### 编辑式生成 (Edit-Based Generation)
@@ -192,3 +206,5 @@ pytest tests/ --cov=src --cov-report=html
 - **新编辑操作**：在 `src/editing/operations.py` 中添加新的 `EditOpType`，在 `editor.py` 中实现对应的 handler
 - **微调评价模型**：`SlideEvaluator` 预留了 `_EVAL_MODEL_PATH` 接口
 - **自定义图表样式**：扩展 `src/generation/chart_generator.py`
+
+## 效果预览
