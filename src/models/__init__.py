@@ -77,6 +77,7 @@ class SlideState(TypedDict):
     evaluation_scores: dict[str, float]     # dimension → score
     overall_score: float
     revision_round: int
+    score_history: list[float]               # score after each evaluation round (before/after revision)
     is_acceptable: bool
 
 

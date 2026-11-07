@@ -55,18 +55,34 @@ class ViTFeatureExtractor:
         if hf_endpoint and hf_endpoint != "https://huggingface.co":
             os.environ.setdefault("HF_ENDPOINT", hf_endpoint)
 
-        self._processor = ViTImageProcessor.from_pretrained(self._model_name)
+        # Load from cache when available: local_files_only=True skips the
+        # network HEAD check that hangs when HF is unreachable (common in
+        # China). Falls back to online download only when not cached yet.
+        try:
+            self._processor = ViTImageProcessor.from_pretrained(
+                self._model_name, local_files_only=True
+            )
+        except Exception:
+            self._processor = ViTImageProcessor.from_pretrained(self._model_name)
 
         # Suppress the transformers "LOAD REPORT" print (classifier/pooler
         # mismatch is expected — we only need the encoder for embeddings).
         _prev_verbosity = transformers_logging.get_verbosity()
         transformers_logging.set_verbosity_error()
 
-        self._model = ViTModel.from_pretrained(
-            self._model_name,
-            add_pooling_layer=True,        # match checkpoint's pooler
-            ignore_mismatched_sizes=True,   # skip checkpoint's classifier head
-        ).to(self._device)
+        try:
+            self._model = ViTModel.from_pretrained(
+                self._model_name,
+                add_pooling_layer=True,        # match checkpoint's pooler
+                ignore_mismatched_sizes=True,   # skip checkpoint's classifier head
+                local_files_only=True,
+            ).to(self._device)
+        except Exception:
+            self._model = ViTModel.from_pretrained(
+                self._model_name,
+                add_pooling_layer=True,
+                ignore_mismatched_sizes=True,
+            ).to(self._device)
 
         transformers_logging.set_verbosity(_prev_verbosity)
         self._model.eval()

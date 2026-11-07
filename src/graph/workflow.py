@@ -5,7 +5,7 @@ Node sequence:
     1. parse_documents    — parse source + reference PPT
     2. analyze_style      — ViT clustering + schema extraction
     3. plan_outline       — LLM generates slide-by-slide plan
-    4. edit_loop          — per-slide: observe → edit → execute → evaluate → (revise?)
+    4. generate_slides    — all slides in parallel rounds: edit → execute → evaluate → (revise?)
     5. finalize           — save PPT, build report
 """
 
@@ -55,28 +55,15 @@ def build_workflow() -> StateGraph:
     workflow.add_node("parse_documents", parse_documents_node)
     workflow.add_node("analyze_style", analyze_style_node)
     workflow.add_node("plan_outline", plan_outline_node)
-    workflow.add_node("edit_slide", edit_slide_node)
-    workflow.add_node("evaluate_slide", evaluate_slide_node)
+    workflow.add_node("generate_slides", generate_slides_node)
     workflow.add_node("finalize", finalize_node)
 
     # ── Define edges ────────────────────────────────────────────────────
     workflow.set_entry_point("parse_documents")
     workflow.add_edge("parse_documents", "analyze_style")
     workflow.add_edge("analyze_style", "plan_outline")
-    workflow.add_edge("plan_outline", "edit_slide")
-
-    # After edit → evaluate
-    workflow.add_edge("edit_slide", "evaluate_slide")
-
-    # After evaluation: revise, next, or finish
-    workflow.add_conditional_edges(
-        "evaluate_slide",
-        lambda s: (
-            "finish" if s["current_slide_idx"] >= len(s["slide_states"])
-            else s.get("_route", "next")
-        ),
-        {"revise": "edit_slide", "next": "edit_slide", "finish": "finalize"},
-    )
+    workflow.add_edge("plan_outline", "generate_slides")
+    workflow.add_edge("generate_slides", "finalize")
     workflow.add_edge("finalize", END)
 
     return workflow.compile()
@@ -786,7 +773,7 @@ def plan_outline_node(state: AgentState) -> AgentState:
 
     # ── Initialize the output presentation ──────────────────────────────
     # Keep the reference PPT INTACT with all its slides. We'll clone
-    # representative slides in edit_slide_node. This preserves ALL shapes,
+    # representative slides in generate_slides_node. This preserves ALL shapes,
     # fills, images, and decorations without any XML manipulation.
     ref_pptx = state.get("reference_pptx")
     if ref_pptx is not None:
@@ -819,6 +806,7 @@ def plan_outline_node(state: AgentState) -> AgentState:
             evaluation_scores={},
             overall_score=0.0,
             revision_round=0,
+            score_history=[],
             is_acceptable=False,
         ))
     state["slide_states"] = slide_states
@@ -827,238 +815,155 @@ def plan_outline_node(state: AgentState) -> AgentState:
     return state
 
 
-def edit_slide_node(state: AgentState) -> AgentState:
-    """Node 4: Generate and execute edits for the current slide.
+def generate_slides_node(state: AgentState) -> AgentState:
+    """Node 4: Generate all slides via round-based generation.
 
-    Uses SINGLE-TURN JSON mode (fast, one LLM call per slide).
-    Every slide starts blank — always ADD-only, no modify/delete needed.
+    Edits are generated + applied sequentially (DeepSeek rate-limits
+    concurrency, so parallelizing LLM calls buys nothing). Evaluation is
+    batched into ONE LLM call per round to cut the dominant cost (call count).
     """
-    current_idx = state["current_slide_idx"]
-    # Guard: stop if past last slide (evaluate advances past end)
-    if current_idx >= len(state["slide_states"]):
-        return state
+    import random
+    from src.editing.llm_editor import LLMEditor
+    from src.editing.editor import EditEngine
+    from src.evaluation.evaluator import llm_evaluate_batch
+    from src.pptx_io.writer import duplicate_slide, add_slide, clear_slide_text
 
     outline = state["outline"]
-    slide_state = state["slide_states"][current_idx]
-
-    print(f"\n  [Slide {current_idx + 1}/{len(outline)}] "
-          f"生成: {outline[current_idx].get('title', 'Untitled')}")
-
     schemas = state["layout_schemas"]
     source_doc = state["source_doc"]
     output_pptx = state["output_pptx"]
+    slide_states = state["slide_states"]
 
-    # Find schema + enrichment for this slide
-    schema: dict[str, Any] = {}
-    enrichment: dict[str, Any] = {}
-    for s in schemas:
-        if s["schema_id"] == slide_state["schema_id"]:
-            schema = s
-            break
-    # Read enrichment from the PLAIN DICT (safe from TypedDict stripping)
-    enrichment = state.get("style_enrichment", {}).get(slide_state["schema_id"], {})
+    MAX_REVISIONS = 2
+    PASS_THRESHOLD = 6.0
 
-    # Diagnostic: show what style data was extracted
-    if current_idx == 0:
-        has_bg = bool(enrichment.get("slide_background_xml"))
-        n_shapes = len(enrichment.get("shapes_xml", []))
-        fonts = enrichment.get("extracted_fonts", {})
-        print(f"     [风格数据] BG={'✓' if has_bg else '✗'} shapes={n_shapes} "
-              f"font={fonts.get('main_font', '?')} "
-              f"title_size={fonts.get('title_size', '?')} "
-              f"color=#{fonts.get('main_color', '?')}")
+    # ── Phase 1: pre-create + prepare all slides (sequential, no LLM) ──
+    per_slide: dict[int, dict[str, Any]] = {}
+    for idx in range(len(outline)):
+        slide_state = slide_states[idx]
 
-    # Ensure the slide exists and is ready for editing
-    # For extra slides beyond template count, duplicate a random template
-    import random
-    is_new_slide = current_idx >= len(output_pptx.slides)
-    while current_idx >= len(output_pptx.slides):
-        from src.pptx_io.writer import duplicate_slide, clear_slide_text
-        if len(output_pptx.slides) > 0:
-            src = random.choice(list(output_pptx.slides))
-            new_s = duplicate_slide(output_pptx, src)
-            clear_slide_text(new_s)  # Clear old text, keep decorations + images
-        else:
-            from src.pptx_io.writer import add_slide
-            add_slide(output_pptx, layout_index=0)
+        schema: dict[str, Any] = {}
+        for s in schemas:
+            if s["schema_id"] == slide_state["schema_id"]:
+                schema = s
+                break
+        enrichment = state.get("style_enrichment", {}).get(slide_state["schema_id"], {})
 
-    actual_slide = output_pptx.slides[current_idx]
+        is_new_slide = idx >= len(output_pptx.slides)
+        while idx >= len(output_pptx.slides):
+            if len(output_pptx.slides) > 0:
+                src = random.choice(list(output_pptx.slides))
+                new_s = duplicate_slide(output_pptx, src)
+                clear_slide_text(new_s)
+            else:
+                add_slide(output_pptx, layout_index=0)
 
-    # ALWAYS clear text on existing slides (template or new)
-    from src.pptx_io.writer import clear_slide_text
-    saved_fonts = _prepare_slide_for_editing(actual_slide)
-    if saved_fonts:
-        enrichment = dict(enrichment)
-        enrichment["_saved_fonts"] = saved_fonts
+        actual_slide = output_pptx.slides[idx]
+        saved_fonts = _prepare_slide_for_editing(actual_slide)
+        if is_new_slide:
+            bg_xml = enrichment.get("slide_background_xml")
+            if bg_xml:
+                _apply_slide_background(actual_slide, bg_xml)
 
-    # Apply background to new blank slides
-    if is_new_slide:
-        bg_xml = enrichment.get("slide_background_xml")
-        if bg_xml:
-            _apply_slide_background(actual_slide, bg_xml)
+        per_slide[idx] = {
+            "schema": schema,
+            "enrichment": enrichment,
+            "saved_fonts": saved_fonts,
+        }
 
-    # Verify text cleared
-    leftover = sum(1 for s in actual_slide.shapes
-                   if s.has_text_frame and s.text_frame.text.strip())
-    if leftover > 0 and current_idx < 3:
-        print(f"     ⚠ {leftover} shapes still have text: "
-              + ", ".join(f"'{s.text_frame.text[:30]}'" for s in actual_slide.shapes
-                          if s.has_text_frame and s.text_frame.text.strip()))
-
-    # Content for this slide
-    content: dict[str, Any] = {}
-    if current_idx < len(outline):
-        content = outline[current_idx].get("content", {})
-    # On revision, inject previous feedback
-    if slide_state["revision_round"] > 0:
-        fb = slide_state.get("evaluation_feedback", "")
-        if fb:
-            content["_revision_feedback"] = fb
-
-    # Images: only real existing files
+    # ── Phase 2: round-based generation — sequential edits + batched eval ──
+    # ponytail: edits stay sequential (DeepSeek rate-limits concurrency, so
+    # parallelizing LLM calls buys nothing); only evaluation is batched into
+    # a single LLM call per round to cut the dominant cost (call count).
     raw_images = source_doc.get("images", []) if source_doc else []
     available_images = [
         img for img in raw_images
-        if img.get("path_to_saved_image")
-        and Path(img["path_to_saved_image"]).exists()
+        if img.get("path_to_saved_image") and Path(img["path_to_saved_image"]).exists()
     ]
     available_tables = source_doc.get("tables", []) if source_doc else []
-    if current_idx == 0 and available_images:
-        print(f"    源文档图片: {len(available_images)}张可用 "
-              f"({len(raw_images)}张提取, {len(raw_images) - len(available_images)}张缺失)")
+    if available_images:
+        print(f"    源文档图片: {len(available_images)}张可用")
 
-    # Get HTML view of actual slide
-    actual_slide = output_pptx.slides[current_idx]
-    slide_state["html_view"] = slide_to_html(actual_slide, current_idx)
-
-    # ── Single LLM call ───────────────────────────────────────────────
-    print(f"     → LLM 生成编辑指令...")
-    from src.editing.llm_editor import LLMEditor
-    llm_editor = LLMEditor()
-
-    # Inject font info + shape sizes into content for LLM
-    fonts = enrichment.get("extracted_fonts", {})
-    if fonts:
-        content["_fonts"] = fonts
-    if enrichment.get("_saved_fonts"):
-        content["_shape_sizes"] = enrichment["_saved_fonts"]
-
-    # Determine if slide has existing shapes (cloned from template)
-    # vs. being truly blank (added as new). Cloned slides have shapes
-    # that should be filled via modify_text, not add_text.
-    has_existing_shapes = len(actual_slide.shapes) > 2
-
-    try:
-        edit_ops = llm_editor.generate_edits_single_turn(
-            slide_html=slide_state["html_view"],
-            schema=schema,
-            content=content,
-            is_fresh_slide=not has_existing_shapes,
-            available_images=available_images,
-            available_tables=available_tables,
-        )
-    except Exception as e:
-        logger.warning("LLM edit generation failed for slide %d: %s", current_idx, e)
-        print(f"     ⚠ LLM 调用失败: {e}")
-        edit_ops = []
-
-    logger.info("Generated %d edits for slide %d", len(edit_ops), current_idx)
-    if not edit_ops:
-        print(f"     ⚠ LLM 返回空操作列表 — 跳过")
-
-    # ── Diagnostic: show what was generated ────────────────────────────
-    for op in edit_ops[:5]:
-        stype = op.op_type.value if hasattr(op, 'op_type') else str(op)
-        if hasattr(op, 'payload'):
-            sid = getattr(op.payload, 'shape_id', 'N/A')
-            txt = getattr(op.payload, 'new_text', getattr(op.payload, 'text', ''))[:40]
-            print(f"     [{stype}] shape_id={sid} text='{txt}'")
-
-    # ── Fix slide_idx ───────────────────────────────────────────────────
-    for op in edit_ops:
-        if hasattr(op, 'slide_idx'):
-            op.slide_idx = current_idx
-
-    # ── Diagnostic: show actual shape IDs on the slide ──────────────────
-    actual_ids = [s.shape_id for s in actual_slide.shapes if s.has_text_frame]
-    if current_idx == 0:
-        print(f"     Slide shapes with text: {actual_ids}")
-
-    # ── Execute with per-op diagnostics ─────────────────────────────────
-    from src.editing.editor import EditEngine
+    editor = LLMEditor()
     engine = EditEngine(output_pptx)
-    for op in edit_ops:
-        try:
-            engine.execute(op)
-        except Exception as e:
-            print(f"     ✗ {op.op_type.value}: {str(e)[:80]}")
-    success = sum(1 for op in edit_ops if True)  # approximate
-    if len(edit_ops) > 0:
-        final_text = sum(1 for s in actual_slide.shapes if s.has_text_frame and s.text_frame.text.strip())
-        print(f"     → 最终 {final_text} 个形状有文字")
 
-    # ── Post-edit: enforce fonts with per-shape saved sizes ────────────
-    enforce_data = dict(fonts) if fonts else {}
-    if enrichment.get("_saved_fonts"):
-        enforce_data["_saved_fonts"] = enrichment["_saved_fonts"]
-    if enforce_data:
-        _enforce_font_style(actual_slide, enforce_data)
+    pending = list(range(len(outline)))
+    while pending:
+        # (a) generate + apply edits for each pending slide (sequential)
+        for idx in pending:
+            ctx = per_slide[idx]
+            ss = slide_states[idx]
+            content = dict(outline[idx].get("content", {}))
+            if ss["revision_round"] > 0 and ss.get("evaluation_feedback"):
+                content["_revision_feedback"] = ss["evaluation_feedback"]
+            fonts = ctx["enrichment"].get("extracted_fonts", {})
+            if fonts:
+                content["_fonts"] = fonts
+            if ctx["saved_fonts"]:
+                content["_shape_sizes"] = ctx["saved_fonts"]
+            html = slide_to_html(output_pptx.slides[idx], idx)
+            ss["html_view"] = html
+            has_existing_shapes = len(output_pptx.slides[idx].shapes) > 2
 
-    # Update state
-    slide_state["edit_history"].extend(
-        op.to_dict() if hasattr(op, "to_dict") else op for op in edit_ops
-    )
-    if current_idx < len(output_pptx.slides):
-        slide_state["html_view"] = slide_to_html(output_pptx.slides[current_idx], current_idx)
-    state["edit_log"].extend(
-        op.to_dict() if hasattr(op, "to_dict") else op for op in edit_ops
-    )
+            try:
+                ops = editor.generate_edits_single_turn(
+                    slide_html=html,
+                    schema=ctx["schema"],
+                    content=content,
+                    is_fresh_slide=not has_existing_shapes,
+                    available_images=available_images,
+                    available_tables=available_tables,
+                )
+            except Exception as e:
+                logger.warning("LLM edit generation failed for slide %d: %s", idx, e)
+                ops = []
+            for op in ops:
+                op.slide_idx = idx
 
-    return state
+            for op in ops:
+                try:
+                    engine.execute(op)
+                except Exception as e:
+                    print(f"     ✗ {op.op_type.value}: {str(e)[:80]}")
+            ss["edit_history"].extend(
+                op.to_dict() if hasattr(op, "to_dict") else op for op in ops
+            )
+            state["edit_log"].extend(
+                op.to_dict() if hasattr(op, "to_dict") else op for op in ops
+            )
+            enforce_data = dict(fonts or {})
+            if ctx["saved_fonts"]:
+                enforce_data["_saved_fonts"] = ctx["saved_fonts"]
+            if enforce_data:
+                _enforce_font_style(output_pptx.slides[idx], enforce_data)
+            ss["html_view"] = slide_to_html(output_pptx.slides[idx], idx)
 
+        # (b) batch evaluation — ONE LLM call for all pending slides
+        eval_items = []
+        for idx in pending:
+            html = slide_to_html(output_pptx.slides[idx], idx)
+            summary = outline[idx].get("content_summary", "")
+            eval_items.append((idx, html, summary))
+        evals = llm_evaluate_batch(eval_items)
 
-def evaluate_slide_node(state: AgentState) -> AgentState:
-    """Node 5: LLM evaluate + trigger revision if score < threshold."""
-    current_idx = state["current_slide_idx"]
-    if current_idx >= len(state["slide_states"]):
-        return state
-
-    slide_state = state["slide_states"][current_idx]
-    output_pptx = state["output_pptx"]
-    MAX_REVISIONS = 2
-
-    if current_idx < len(output_pptx.slides):
-        html = slide_to_html(output_pptx.slides[current_idx], current_idx)
-        outline = state.get("outline", [])
-        summary = outline[current_idx].get("content_summary", "") if current_idx < len(outline) else ""
-
-        # LLM evaluation
-        from src.evaluation.evaluator import llm_evaluate
-        score, suggestions = llm_evaluate(html, summary)
-        slide_state["overall_score"] = score
-        slide_state["is_acceptable"] = score >= 6.0
-
-        if suggestions:
-            slide_state["evaluation_feedback"] = suggestions
-            slide_state["evaluation_suggestions"] = suggestions.split("\n") if suggestions else []
-
-        print(f"     评分: {score:.1f}/10", end="")
-        if suggestions:
-            print(f" — {suggestions[:80]}...")
-        else:
-            print()
-
-        # Revision logic
-        if score < 6.0 and slide_state["revision_round"] < MAX_REVISIONS:
-            slide_state["revision_round"] += 1
-            state["_route"] = "revise"
-            print(f"     🔄 第{slide_state['revision_round']}/{MAX_REVISIONS}次修正")
-        else:
-            state["current_slide_idx"] = current_idx + 1
-            state["_route"] = "next"
-    else:
-        state["current_slide_idx"] = current_idx + 1
-        state["_route"] = "next"
+        # (c) update state, decide next round
+        next_pending = []
+        for idx in pending:
+            score, suggestions = evals.get(idx, (7.0, ""))
+            ss = slide_states[idx]
+            ss["overall_score"] = score
+            ss["score_history"].append(score)
+            ss["is_acceptable"] = score >= PASS_THRESHOLD
+            if suggestions:
+                ss["evaluation_feedback"] = suggestions
+            print(f"  [Slide {idx + 1}/{len(outline)}] 评分: {score:.1f}/10", end="")
+            if score < PASS_THRESHOLD and ss["revision_round"] < MAX_REVISIONS:
+                ss["revision_round"] += 1
+                next_pending.append(idx)
+                print(f" — 🔄 第{ss['revision_round']}/{MAX_REVISIONS}次修正")
+            else:
+                print()
+        pending = next_pending
 
     return state
 
@@ -1145,6 +1050,7 @@ def finalize_node(state: AgentState) -> AgentState:
                 "slide_idx": s["slide_idx"],
                 "score": s["overall_score"],
                 "revisions": s["revision_round"],
+                "score_history": s["score_history"],
                 "acceptable": s["is_acceptable"],
             }
             for s in slide_states

@@ -49,6 +49,64 @@ def llm_evaluate(
         return 7.0, ""
 
 
+def llm_evaluate_batch(
+    items: list[tuple[int, str, str]],
+    client: Optional[LLMClient] = None,
+) -> dict[int, tuple[float, str]]:
+    """Evaluate multiple slides in ONE LLM call (reduces LLM call count).
+
+    Args:
+        items: list of (slide_idx, html, content_summary).
+        client: optional LLM client.
+
+    Returns:
+        dict mapping slide_idx → (score, suggestions).
+    """
+    if not items:
+        return {}
+
+    client = client or get_llm_client()
+    blocks = []
+    for idx, html, summary in items:
+        blocks.append(
+            f"### Slide {idx}\n"
+            f"Intended content: {summary}\n"
+            f"HTML:\n```html\n{html[:2000]}\n```"
+        )
+
+    prompt = (
+        "Score each slide 1-10 on content quality and conciseness.\n\n"
+        + "\n\n".join(blocks)
+        + "\n\nReturn a JSON array: "
+        '[{"slide_idx": 0, "score": 7.5, "suggestions": "..."}, ...]\n'
+        "Be critical. For any slide scored below 7, give specific, actionable suggestions."
+    )
+
+    try:
+        result = client.json_chat(prompt)
+    except Exception:
+        return {idx: (7.0, "") for idx, _, _ in items}
+
+    arr = result if isinstance(result, list) else result.get("slides", result.get("results", []))
+    score_map: dict[int, tuple[float, str]] = {}
+    if isinstance(arr, list):
+        for it in arr:
+            if not isinstance(it, dict):
+                continue
+            try:
+                score_map[int(it.get("slide_idx"))] = (
+                    min(10, max(1, float(it.get("score", 7.0)))),
+                    str(it.get("suggestions", "")),
+                )
+            except (TypeError, ValueError):
+                continue
+
+    return {
+        idx: score_map.get(idx, (7.0, ""))
+        for idx, _, _ in items
+    }
+
+
 @dataclass
 class EvaluationResult:
     """Structured evaluation result for a single slide."""
